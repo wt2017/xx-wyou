@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+
+set -e
+
+ld64 "$@"
+
+out="a.out"
+isout=
+
+for f in "$@"; do
+  if [ -n "$isout" ]; then
+    isout=
+    out="$f"
+  fi
+  if [ "$f" = "-o" ]; then
+    isout=1
+  fi
+done
+
+codesign -f -s - "$out"

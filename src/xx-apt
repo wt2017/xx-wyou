@@ -1,0 +1,288 @@
+#!/usr/bin/env sh
+
+set -e
+
+if [ -z "$XX_APT_NOLOCK" ]; then
+  if [ -L /var/lock ] && [ ! -e "$(readlink -f /var/lock)" ]; then
+    mkdir -p "$(readlink -f /var/lock)"
+  elif [ ! -d /var/lock ]; then
+    mkdir -p /var/lock
+  fi
+  lock="/var/lock/xx-apt"
+  exec 9>$lock
+  flock -x 9
+  export XX_APT_NOLOCK=1
+fi
+
+if [ -n "$XX_DEBUG_APT" ]; then
+  set -x
+fi
+
+for l in $(xx-info env); do
+  export "${l?}"
+done
+
+checkpkg() {
+  apt show "$@"
+}
+
+aptsourcesfile() {
+  if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+    echo /etc/apt/sources.list.d/debian.sources
+  elif [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    echo /etc/apt/sources.list.d/ubuntu.sources
+  else
+    echo /etc/apt/sources.list
+  fi
+}
+
+check_deb822() {
+  # shellcheck disable=SC2046
+  [ "$(printf '%s' $(aptsourcesfile) | awk -F . '{if (NF>1) {print $NF}}')" = "sources" ] && return 0 || return 1
+}
+
+exitnolinux() {
+  if [ "${TARGETOS}" != "linux" ]; then
+    echo >&2 "skipping packages installation on ${XX_OS}"
+    exit 0
+  fi
+}
+
+n=$#
+for a in "$@"; do
+  if [ $# = $n ]; then set --; fi
+  case "$a" in
+    "--print-source-file")
+      aptsourcesfile
+      exit 0
+      ;;
+    *)
+      set -- "$@" "$a"
+      ;;
+  esac
+done
+
+# these are not supported yet
+case "${TARGETARCH}" in
+  mips*)
+    echo >&2 "skipping packages installation on ${XX_ARCH}"
+    exit 0
+    ;;
+  riscv*)
+    case "${XX_VENDOR}" in
+      debian)
+        if ! grep "sid main" "$(aptsourcesfile)" >/dev/null; then
+          echo >&2 "skipping packages installation on ${XX_ARCH}. riscv64 currently only supported on sid"
+          exit 0
+        fi
+        ;;
+      ubuntu)
+        if ! grep 'VERSION="2' /etc/os-release >/dev/null 2>/dev/null; then
+          echo >&2 "skipping packages installation on ${XX_ARCH}. riscv64 requires 20.04+"
+          exit 0
+        fi
+        ;;
+    esac
+    ;;
+  *) ;;
+
+esac
+
+arg0="$(basename "$0")"
+if [ "$arg0" = "xx-apt-get" ]; then
+  arg0="apt-get"
+else
+  arg0="apt"
+fi
+
+fixubuntusources() {
+  # fix all current sources to native arch
+  nativearch="$(TARGETPLATFORM="" TARGETPAIR="" TARGETARCH="" TARGETOS="" xx-info arch)"
+  if ! check_deb822; then
+    sed -E "/arch=/! s/^(# )?(deb|deb-src) /\1\2 [arch=$nativearch] /" -i "$(aptsourcesfile)"
+  else
+    sed -E "/Architectures:/! s/^(Types\: [a-z]+)/\1\nArchitectures: $nativearch/" -i "$(aptsourcesfile)"
+  fi
+
+  if ! xx-info is-cross; then return; fi
+
+  # add custom list for target
+  debarch=$(xx-info debian-arch)
+  if ! check_deb822; then
+    targetlist=/etc/apt/sources.list.d/xx-$debarch.list
+  else
+    targetlist=/etc/apt/sources.list.d/xx-$debarch.sources
+  fi
+  if [ -f "$targetlist" ]; then return; fi
+
+  mainurl=archive.ubuntu.com/ubuntu
+  securityurl=security.ubuntu.com/ubuntu
+
+  case "${debarch}" in
+    arm64 | armhf | ppc64el | s390x | riscv64)
+      mainurl=ports.ubuntu.com/ubuntu-ports
+      securityurl=$mainurl
+      ;;
+  esac
+
+  # shellcheck disable=SC1091
+  ubuntuname=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
+  if ! check_deb822; then
+    cat <<eot >"$targetlist"
+deb [arch=$debarch] http://$mainurl/ $ubuntuname main restricted universe multiverse
+deb [arch=$debarch] http://$mainurl/ $ubuntuname-updates main restricted universe multiverse
+deb [arch=$debarch] http://$mainurl/ $ubuntuname-backports main restricted universe multiverse
+deb [arch=$debarch] http://$securityurl/ $ubuntuname-security main restricted universe multiverse
+eot
+  else
+    cat <<eot >"$targetlist"
+Types: deb
+Architectures: $debarch
+URIs: http://$mainurl/
+Suites: $ubuntuname $ubuntuname-updates $ubuntuname-backports
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+Architectures: $debarch
+URIs: http://$securityurl/
+Suites: $ubuntuname-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+eot
+  fi
+}
+
+packages=
+parsed=
+n=$#
+for p in "$@"; do
+  if [ $# = $n ]; then set --; fi
+  arg=
+  case "$p" in
+    -*)
+      arg="$p"
+      ;;
+    "install" | "remove" | "search" | "show" | "list" | "info")
+      parsed=1
+      arg="$p"
+      ;;
+    *)
+      if [ -n "$parsed" ]; then
+        if [ -z "${packages}" ]; then
+          packages="$p"
+        else
+          packages="${packages} ${p}"
+        fi
+      else
+        arg="$p"
+      fi
+      ;;
+  esac
+  if [ -n "$arg" ]; then
+    set -- "$@" "$arg"
+  fi
+done
+
+if [ -z "${parsed}" ]; then
+  exitnolinux
+  exec apt "$@"
+fi
+
+nocross=
+if ! xx-info is-cross; then
+  nocross=1
+fi
+
+if [ "$TARGETARCH" = "riscv64" ] && [ "$(xx-info vendor)" = "debian" ]; then
+  apt-get update
+  apt-get install -y debian-ports-archive-keyring
+  echo "deb [ arch=riscv64 ] http://ftp.ports.debian.org/debian-ports sid main" >>/etc/apt/sources.list.d/riscv64-sid.list
+fi
+
+if ! dpkg --print-foreign-architectures | grep "$XX_PKG_ARCH" >/dev/null; then
+  if [ "$XX_OS" = "linux" ]; then
+    if [ "$(xx-info vendor)" = "ubuntu" ] && [ -z "$nocross" ]; then
+      # ubuntu uses different repositories for amd64/386 and rest of the architectures
+      # so we need to fix the sources.list and add new ones
+      fixubuntusources
+    fi
+
+    dpkg --add-architecture "$XX_PKG_ARCH"
+  fi
+  apt-get update
+fi
+
+suffix=$XX_TRIPLE
+if [ "$suffix" = "x86_64-linux-gnu" ]; then
+  suffix="x86-64-linux-gnu"
+fi
+if [ "$XX_OS" = "windows" ]; then
+  case "$XX_ARCH" in
+    amd64) suffix="mingw-w64-x86-64" ;;
+    386) suffix="mingw-w64-i686" ;;
+    arm64) suffix="mingw-w64-aarch64" ;;
+    arm) suffix="mingw-w64-arm" ;;
+  esac
+fi
+
+gccvers="12 11 10 9"
+packages2=
+for p in ${packages}; do
+  if [ "${p}" = "xx-c-essentials" ]; then
+    p="libc6-dev"
+    libgccVer=
+    for gccver in ${gccvers}; do
+      if checkpkg "libgcc-${gccver}-dev:${XX_PKG_ARCH}" >/dev/null 2>/dev/null; then
+        libgccVer=$gccver
+        break
+      fi
+    done
+    if [ -z "$libgccVer" ]; then
+      libgccVer=8
+    fi
+    p="$p libgcc-${libgccVer}-dev"
+  elif [ "${p}" = "xx-cxx-essentials" ]; then
+    libstdcxxVer=
+    for gccver in ${gccvers}; do
+      if checkpkg "libstdc++-${gccver}-dev:${XX_PKG_ARCH}" >/dev/null 2>/dev/null; then
+        libstdcxxVer=$gccver
+        break
+      fi
+    done
+    if [ -z "$libstdcxxVer" ]; then
+      libstdcxxVer=8
+    fi
+    p="libstdc++-${libstdcxxVer}-dev"
+  fi
+  if [ -z "$packages2" ]; then
+    packages2="$p"
+  else
+    packages2="${packages2} $p"
+  fi
+done
+
+empty=1
+for p in ${packages2}; do
+  n=
+  if [ -n "$nocross" ]; then
+    n=${p}
+  elif checkpkg "${p}-${suffix}" >/dev/null 2>/dev/null; then
+    n="${p}-${suffix}"
+  elif [ "${XX_OS}" = "linux" ] && [ -n "${XX_APT_PREFER_CROSS}" ] && checkpkg "${p}-${XX_PKG_ARCH}-cross" >/dev/null 2>/dev/null; then
+    n="${p}-${XX_PKG_ARCH}-cross"
+  elif [ "${XX_OS}" = "linux" ]; then
+    n="${p}:${XX_PKG_ARCH}"
+  else
+    continue
+  fi
+  empty=
+  set -- "$@" "$n"
+done
+
+if [ -n "$empty" ]; then
+  exitnolinux
+fi
+
+echo >&2 "+ $arg0 " "$@"
+exec "$arg0" "$@"

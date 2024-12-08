@@ -1,0 +1,686 @@
+#!/usr/bin/env sh
+
+: "${LD_MIRRORS=}"
+: "${LD_SHAS=}"
+: "${LD64_SHAS=}"
+
+set -e
+
+# shellcheck disable=SC1090
+. "$(command -v xx-ld-shas)"
+
+if [ -n "$XX_MIRROR" ]; then
+  LD_MIRRORS="$XX_MIRROR"
+fi
+
+_wget() {
+  if ! wget "$@"; then
+    if [ "$(wget --help 2>&1 | head -n1 | cut -d' ' -f1)" = "GNU" ]; then
+      return 1
+    fi
+    installwget
+    wget "$@"
+  fi
+}
+
+ensurewget() {
+  # wget is almost always installed but just in case
+  if ! command -v wget >/dev/null 2>/dev/null; then
+    installwget
+  fi
+}
+
+installwget() {
+  if command -v apt >/dev/null 2>/dev/null; then
+    apt update >/dev/null 2>/dev/null && apt install -y --no-install-recommends wget >/dev/null 2>/dev/null
+  fi
+  if command -v apk >/dev/null 2>/dev/null; then
+    apk add wget >/dev/null 2>/dev/null
+  fi
+}
+
+writexcrun() {
+  cat <<'EOF' >/usr/bin/xcrun
+#!/usr/bin/env sh
+
+sdk=
+show_sdk=
+show_version=
+
+macos_sdk_path=/xx-sdk/MacOSX11.1.sdk
+macos_sdk_version=11.1
+
+detectMacOSSDK() {
+  if [ -d "/xx-sdk" ]; then
+    for f in /xx-sdk/MacOSX*.sdk; do
+      macos_sdk_path="$f"
+      trim="${sdk_path#/xx-sdk/MacOSX}"
+      trim="${trim%.sdk}"
+      if [ -n "$trim" ]; then
+        macos_sdk_version=$trim
+      fi
+      break
+    done
+  fi
+}
+
+usage() {
+  cat <<EOT >&2
+minimal xcrun port for xx tools. Only basic options are implemented. PRs welcome!
+
+-h, --help
+--sdk <sdk name>
+--show-sdk-path
+--show-sdk-version
+
+EOT
+}
+
+while :; do
+  case $1 in
+    -h | --help)
+      usage
+      exit
+      ;;
+    --sdk)
+      if [ -n "$2" ]; then
+        sdk=$2
+        shift
+      else
+        echo >&2 "xcrun: error: argument to '--sdk' is missing"
+      fi
+      ;;
+    --show-sdk-path)
+      show_sdk=1
+      ;;
+    --show-sdk-version)
+      show_version=1
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -?*)
+      echo >&2 "option $1 not found or unimplemented"
+      ;;
+    *)
+      break
+      ;;
+  esac
+  shift
+done
+
+if [ -n "$sdk" ] && [ "$sdk" != "macosx" ] && [ "$sdk" != "macosx11.1" ]; then
+  echo >&2 "sdk $sdk not found"
+  exit 1
+fi
+
+if [ -n "$show_sdk" ]; then
+  detectMacOSSDK
+  echo $macos_sdk_path
+  exit 0
+fi
+
+if [ -n "$show_version" ]; then
+  detectMacOSSDK
+  echo $macos_sdk_version
+  exit 0
+fi
+
+if [ -n "$1" ]; then
+  "$@"
+else
+  usage
+  exit 1
+fi
+EOF
+  chmod +x /usr/bin/xcrun
+}
+
+macos_sdk_path=/xx-sdk/MacOSX11.1.sdk
+
+detectTargetOSArch() {
+  targetos=""
+  if [ "${target#*-linux-}" != "${target}" ]; then
+    targetos="linux"
+  elif [ "${target#*-apple-macos}" != "${target}" ]; then
+    targetos="darwin"
+  elif [ "${target#*-w64-mingw32}" != "${target}" ]; then
+    targetos="windows"
+  fi
+
+  if [ -z "$targetos" ]; then
+    targetos=$(xx-info os)
+  fi
+
+  arch=$(echo "$target" | cut -d- -f1)
+  targetarch=""
+  targetvariant=""
+
+  if [ "$arch" = "aarch64" ] || [ "$arch" = "arm64" ]; then
+    targetarch="arm64"
+  elif [ "$arch" = "x86_64" ]; then
+    targetarch="amd64"
+  elif [ "$arch" = "armv7" ] || [ "$arch" = "arm" ]; then
+    targetarch="arm"
+    targetvariant="v7"
+  elif [ "$arch" = "armv6" ]; then
+    targetarch="arm"
+    targetvariant="v6"
+  elif [ "$arch" = "i386" ] || [ "$arch" = "i586" ] || [ "$arch" = "i686" ]; then
+    targetarch="386"
+  elif [ "$arch" = "riscv64" ]; then
+    targetarch="riscv64"
+  elif [ "$arch" = "s390x" ]; then
+    targetarch="s390x"
+  elif [ "$arch" = "powerpc64le" ]; then
+    targetarch="ppc64le"
+  fi
+
+  if [ -z "$targetarch" ]; then
+    targetarch=$(xx-info arch)
+    targetvariant=$(xx-info variant)
+  fi
+}
+
+detectMacOSSDK() {
+  if [ -d "/xx-sdk" ]; then
+    for f in /xx-sdk/MacOSX*.sdk; do
+      macos_sdk_path="$f"
+      break
+    done
+  fi
+}
+
+download_ld64() {
+  if [ -n "$XX_NO_DOWNLOAD" ]; then
+    return
+  fi
+  ensurewget
+
+  file="ld64-signed-$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info os)-$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info arch)$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info variant)"
+  sha=$(echo "$LD64_SHAS" | grep "$file" | cut -d' ' -f2 || true)
+
+  if [ -z "$sha" ]; then
+    return
+  fi
+
+  tmpdir=$(mktemp -d)
+
+  for m in $LD_MIRRORS; do
+    if ! _wget "$m/$file.tar.gz" -q -O "$tmpdir/$file.tar.gz" >/dev/null 2>/dev/null; then
+      if ! _wget --no-check-certificate "$m/$file.tar.gz" -q -O "$tmpdir/$file.tar.gz" >/dev/null 2>/dev/null; then
+        continue
+      fi
+    fi
+    if [ -z "$XX_DOWNLOAD_NO_VALIDATE" ]; then
+      sha2="$(sha1sum "$tmpdir/$file.tar.gz" | cut -d' ' -f1)"
+      if [ "$sha" != "$sha2" ]; then
+        echo >&2 "checksum mismatch for $file.tar.gz $sha $sha2"
+        rm "$tmpdir/$file.tar.gz"
+        continue
+      fi
+    fi
+    tar xzf "$tmpdir/$file.tar.gz" -C /usr/bin
+    ln -s ld64.signed "/usr/bin/$target-ld"
+    rm "$tmpdir/$file.tar.gz"
+    break
+  done
+
+  rm -r "$tmpdir"
+  if [ -f "/usr/bin/$target-ld" ]; then
+    linker="/usr/bin/$target-ld"
+  fi
+}
+
+download_ld() {
+  if [ -n "$XX_NO_DOWNLOAD" ]; then
+    return
+  fi
+  ensurewget
+
+  file="$targetos-$targetarch$targetvariant-ld-$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info os)-$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info arch)$(TARGETPLATFORM='' TARGETPAIR='' TARGETOS='' TARGETARCH='' TARGETVARIANT='' xx-info variant)"
+  sha=$(echo "$LD_SHAS" | grep "$file" | cut -d' ' -f2 || true)
+
+  if [ -z "$sha" ]; then
+    return
+  fi
+
+  tmpdir=$(mktemp -d)
+
+  for m in $LD_MIRRORS; do
+    if ! _wget "$m/$file.tar.gz" -q -O "$tmpdir/$file.tar.gz" >/dev/null 2>/dev/null; then
+      if ! _wget --no-check-certificate "$m/$file.tar.gz" -q -O "$tmpdir/$file.tar.gz" >/dev/null 2>/dev/null; then
+        continue
+      fi
+    fi
+    if [ -z "$XX_DOWNLOAD_NO_VALIDATE" ]; then
+      sha2="$(sha1sum "$tmpdir/$file.tar.gz" | cut -d' ' -f1)"
+      if [ "$sha" != "$sha2" ]; then
+        echo >&2 "checksum mismatch for $file.tar.gz $sha $sha2"
+        rm "$tmpdir/$file.tar.gz"
+        continue
+      fi
+    fi
+    tar xzf "$tmpdir/$file.tar.gz" -C /usr/bin
+    ln -s "$targetos-$targetarch$targetvariant-ld" "/usr/bin/$target-ld"
+    rm "$tmpdir/$file.tar.gz"
+    break
+  done
+
+  rm -r "$tmpdir"
+  if [ -f "/usr/bin/$target-ld" ]; then
+    linker="/usr/bin/$target-ld"
+  fi
+}
+
+basename=$(basename "$0")
+name=${basename#xx-}
+
+# XX_CC_PREFER_LINKER defines the linker to use if the compiler supports it
+: "${XX_CC_PREFER_LINKER=lld}"
+# XX_CC_PREFER_STATIC_LINKER prefers ld to lld in ppc64le and 386. This is recommended for building static binaries.
+: "${XX_CC_PREFER_STATIC_LINKER=}"
+
+if [ "$name" = "cc" ]; then
+  name="clang"
+fi
+
+if [ "$name" = "c++" ]; then
+  name="clang++"
+fi
+
+wrapped=
+if [ "xx-$name" = "$basename" ]; then
+  wrapped=1
+fi
+
+if [ -f /.xx-cc-autowrap ]; then
+  wrapped=1
+fi
+
+setup() {
+  if [ -z "$XX_CC_NOLOCK" ]; then
+    if [ -L /var/lock ] && [ ! -e "$(readlink -f /var/lock)" ]; then
+      mkdir -p "$(readlink -f /var/lock)"
+    elif [ ! -d /var/lock ]; then
+      mkdir -p /var/lock
+    fi
+    lock="/var/lock/xx-cc"
+    exec 9>$lock
+    flock -x 9
+    export XX_CC_NOLOCK=1
+  fi
+
+  done_file="/usr/bin/${target}.cfg"
+  if [ -z "${target}" ]; then
+    done_file="/etc/llvm/xx-default.cfg"
+  fi
+  if [ -f "$done_file" ]; then
+    return
+  fi
+
+  if [ ! -f /usr/bin/"$name" ]; then
+    echo >&2 "/usr/bin/$name not found"
+    exit 1
+  fi
+
+  detectTargetOSArch
+
+  linker=
+  prefer_lld=1
+  is_bfd=
+
+  # lld has no support for s390x
+  if [ "${target#s390x}" != "${target}" ]; then
+    prefer_lld=
+  fi
+  # lld fails with: relocation R_RISCV_ALIGN requires unimplemented linker relaxation; recompile with -mno-relax
+  if [ "${target#riscv64}" != "${target}" ]; then
+    prefer_lld=
+  fi
+
+  if [ -n "${XX_CC_PREFER_STATIC_LINKER}" ] && { [ "${target#386}" != "${target}" ] || [ "${target#powerpc64le}" != "${target}" ]; }; then
+    prefer_lld=
+  fi
+
+  if [ "$targetos" = "darwin" ]; then
+    if command -v ld64.signed >/dev/null 2>/dev/null; then
+      linker=$(command -v ld64.signed)
+    else
+      download_ld64
+      if [ -z "$linker" ]; then
+        if ! command -v ld64 >/dev/null 2>/dev/null; then
+          echo >&2 "error: building for darwin requires ld64 linker"
+        fi
+        linker=ld64
+      fi
+    fi
+  fi
+
+  if [ -z "$linker" ] && [ -n "$prefer_lld" ] && [ "${XX_CC_PREFER_LINKER}" = "lld" ]; then
+    if command -v lld >/dev/null 2>/dev/null; then
+      linker="lld"
+    fi
+  fi
+
+  if [ -z "$linker" ] && [ "${XX_CC_PREFER_LINKER}" = "gold" ]; then
+    if [ -z "${linker}" ]; then
+      ld=$(command -v "$target-gold" 2>/dev/null || true)
+      if [ -n "$ld" ]; then
+        linker=${ld}
+      fi
+    fi
+    if [ -z "${linker}" ] && [ -f "/${target}/bin/gold" ]; then
+      linker="/${target}/bin/gold"
+    fi
+  fi
+
+  if [ -z "${linker}" ]; then
+    ld=$(command -v "$target-ld" 2>/dev/null || true)
+    if [ -n "$ld" ]; then
+      linker=${ld}
+      XX_CC_PREFER_LINKER=
+      is_bfd=1
+    fi
+  fi
+  if [ -z "${linker}" ] && [ -f "/${target}/bin/ld" ]; then
+    linker="/${target}/bin/ld"
+    XX_CC_PREFER_LINKER=
+    is_bfd=1
+  fi
+
+  if [ -z "${linker}" ] && command -v ld >/dev/null 2>/dev/null; then
+    exp=$targetarch
+    if [ "$exp" = "amd64" ]; then
+      exp="x86_64"
+    fi
+    if [ "$exp" = "arm64" ]; then
+      exp="aarch64"
+    fi
+    if [ "$exp" = "powerpc64le" ]; then
+      exp="ppc"
+    fi
+    if [ "$exp" = "s390x" ]; then
+      exp="s390"
+    fi
+    if [ "$exp" = "riscv64" ]; then
+      exp="riscv"
+    fi
+    if ld -V 2>/dev/null | grep "$exp" >/dev/null; then
+      ln -s "$(command -v ld)" "/usr/bin/${target}-ld"
+      linker="/usr/bin/${target}-ld"
+      XX_CC_PREFER_LINKER=
+      is_bfd=1
+    fi
+  fi
+
+  if [ -z "$linker" ] && [ -n "$prefer_lld" ]; then
+    if command -v lld >/dev/null 2>/dev/null; then
+      linker="lld"
+    fi
+  fi
+  if [ -z "${linker}" ] || [ "$XX_CC_PREFER_LINKER" = "ld" ]; then
+    download_ld
+    is_bfd=1
+  fi
+
+  if [ -z "${linker}" ]; then
+    echo >&2 "no suitable linker found for $target. Please install lld or ld for your target"
+    exit 1
+  fi
+
+  nativeTarget=$(TARGETPLATFORM='' TARGETARCH='' TARGETOS='' TARGETPAIR='' xx-info triple)
+
+  if [ ! -f /etc/llvm/xx-default.cfg ]; then
+    if [ "$nativeTarget" = "$target" ]; then
+      mkdir -p /etc/llvm
+      echo "-fuse-ld=${linker}" >/etc/llvm/xx-default.cfg
+    fi
+  fi
+  if [ ! -e /usr/local/bin/clang ]; then
+    # TODO: support installations other than hardcoded /usr/bin and /usr/local/bin
+    ln -s /usr/bin/xx-clang /usr/local/bin/clang 2>/dev/null || true
+    ln -s /usr/bin/xx-clang++ /usr/local/bin/clang++ 2>/dev/null || true
+  fi
+
+  if [ -z "${target}" ]; then
+    return
+  fi
+
+  config="--target=$(echo "${target}" | sed s/^riscv64gc-/riscv64-/) -fuse-ld=${linker}"
+  if [ "${nativeTarget}" != "${target}" ]; then
+    if [ "$targetos" = "darwin" ]; then
+      detectMacOSSDK
+      config="${config} -isysroot ${macos_sdk_path} -stdlib=libc++"
+    elif [ "$targetos" = "windows" ]; then
+      config="${config} -I/usr/${target}/include -L/usr/${target}/lib"
+    elif [ -f /etc/alpine-release ]; then
+      config="${config} --sysroot=/${target}/"
+
+      if [ -n "$is_bfd" ]; then
+        config="${config} -Wl,-rpath-link,/${target}/usr/lib"
+      fi
+
+      cat <<EOT >"/usr/bin/${target}-pkg-config"
+#!/usr/bin/env sh
+export PKG_CONFIG_SYSROOT_DIR=/${target}
+export PKG_CONFIG_LIBDIR=/${target}/usr/lib/pkgconfig/
+exec pkg-config "\$@"
+EOT
+      chmod +x "/usr/bin/${target}-pkg-config"
+
+    fi
+  elif [ ! -f "/usr/bin/${target}-pkg-config" ] && [ ! -h "/usr/bin/${target}-pkg-config" ]; then
+    ln -s pkg-config "/usr/bin/${target}-pkg-config"
+  fi
+  f="$(dirname "$(readlink -f "$(command -v /usr/bin/clang)")")/${target}.cfg"
+  echo "$config" >"${f}"
+  if [ "${f}" != "/usr/bin/${target}.cfg" ]; then
+    ln -s "${f}" "/usr/bin/${target}.cfg"
+  fi
+
+  for f in clang clang++; do
+    if [ -f /usr/bin/$f ]; then
+      if [ -f "/usr/bin/${target}.cfg" ]; then
+        cat <<EOT >"/usr/bin/${target}-$f"
+#!/usr/bin/env sh
+$f --config /usr/bin/${target}.cfg "\$@"
+EOT
+        chmod +x "/usr/bin/${target}-$f"
+      else
+        ln -s $f "/usr/bin/${target}-$f"
+      fi
+    else
+      echo >&2 "/usr/bin/$f not found: skipping"
+    fi
+  done
+
+  for f in addr2line ar as ranlib nm dlltool strip readelf profdata; do
+    if ! command -v "${target}-${f}" >/dev/null 2>/dev/null; then
+      if [ -f "/usr/bin/llvm-${f}" ]; then
+        if echo "${target}" | grep '\.' 2>/dev/null >/dev/null; then
+          cat <<EOT >"/usr/bin/${target}-$f"
+#!/usr/bin/env sh
+llvm-$f "\$@"
+EOT
+          chmod +x "/usr/bin/${target}-$f"
+        else
+          ln -s "llvm-$f" "/usr/bin/${target}-$f"
+        fi
+      fi
+    fi
+  done
+
+  if [ "$targetos" = "windows" ]; then
+    if command -v llvm-rc 2>/dev/null >/dev/null; then
+      if [ ! -f "/usr/bin/${target}-windres" ] && [ ! -h "/usr/bin/${target}-windres" ]; then
+        cat <<EOT >"/usr/bin/${target}-windres"
+#!/usr/bin/env sh
+exec xx-windres --target=${target} "\$@"
+EOT
+        chmod +x "/usr/bin/${target}-windres"
+      fi
+    fi
+  fi
+
+  if [ -f /etc/alpine-release ]; then
+    # if vendor is not alpine then sysroot needs to be linked to the custom vendor
+    alpinetriple=$(echo "$target" | sed s/-[[:alpha:]][[:alpha:]]*-/-alpine-/ | sed s/^riscv64gc-/riscv64-/)
+    if [ "$target" != "$alpinetriple" ]; then
+      # shellcheck disable=SC2044
+      for f in $(find / -type d -name "$alpinetriple"); do
+        ln -s "$alpinetriple" "$(dirname "$f")/$target"
+      done
+    fi
+  fi
+
+  if [ "${targetos}" = "darwin" ]; then
+    if ! command -v xcrun 2>/dev/null >/dev/null; then
+      writexcrun
+    fi
+  fi
+}
+
+check_compiler() {
+  if [ ! -f "/usr/bin/$name" ]; then
+    echo >&2 "/usr/bin/$name not found. Make sure package is installed. xx doesn't currently support binaries in custom location"
+    exit
+  fi
+}
+
+# Contrary to documentation https://clang.llvm.org/docs/UsersManual.html#configuration-files
+# it looks like clang does not pick up any default configuration for targets unless the
+# binary has been renamed.
+# So we always need to wrap clang and load in the target based config here. Even when cross target is not even applied.
+# More on this thread: http://lists.llvm.org/pipermail/cfe-dev/2016-September/050928.html
+
+setupTarget=
+printTarget=
+printCmake=
+printSysroot=
+target=
+nextIsTarget=
+downloadLD=
+for p in "$@"; do
+  # ignore if custom --config already set
+  if [ "${p}" = "--config" ]; then
+    exec "/usr/bin/$name" "$@"
+  fi
+  if [ "${p}" = "--print-target-triple" ] || [ "${p}" = "-print-target-triple" ]; then
+    printTarget=1
+  fi
+  if [ "${p}" = "--setup-target-triple" ] || [ "${p}" = "-setup-target-triple" ]; then
+    setupTarget=1
+  fi
+  if [ "${p}" = "--print-cmake-defines" ] || [ "${p}" = "-print-cmake-defines" ]; then
+    setupTarget=1
+    printCmake=1
+  fi
+  if [ "${p}" = "--print-sysroot" ] || [ "${p}" = "-print-sysroot" ]; then
+    printSysroot=1
+  fi
+  if [ "${p}" = "--download-prog=ld" ]; then
+    downloadLD=1
+  fi
+
+  # handle "-target foo"
+  if [ -n "$nextIsTarget" ]; then
+    target="$p"
+    nextIsTarget=
+  fi
+  if [ "${p}" = "-target" ]; then
+    nextIsTarget=1
+  fi
+  # handle "--target=foo"
+  if [ "${p#--target=}" != "${p}" ]; then
+    target="${p#--target=}"
+  fi
+
+  if [ "${p}" = "--wrap" ] && [ "xx-$name" = "$basename" ]; then
+    touch /.xx-cc-autowrap
+    exit 0
+  fi
+
+  if [ "${p}" = "--unwrap" ] && [ "xx-$name" = "$basename" ]; then
+    rm /.xx-cc-autowrap || true
+    exit 0
+  fi
+done
+
+# if no target set and called with xx- then set target from env
+if [ -z "$target" ] && [ -n "$wrapped" ]; then
+  target=$(xx-info triple)
+fi
+
+if [ -n "$downloadLD" ]; then
+  if [ -z "$target" ]; then
+    target=$(xx-info triple)
+  fi
+  download_ld
+  if [ -n "$linker" ]; then
+    exit 0
+  else
+    exit 1
+  fi
+fi
+
+# if print & target then setup and print current target
+if [ -n "${target}" ] && [ -n "${printTarget}" ]; then
+  setup
+  echo "${target}"
+  exit 0
+fi
+
+if [ -n "${printCmake}" ]; then
+  setup
+  echo -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_ASM_COMPILER=clang -DPKG_CONFIG_EXECUTABLE="$(xx-clang --print-prog-name=pkg-config)" -DCMAKE_C_COMPILER_TARGET="$(xx-clang --print-target-triple)" -DCMAKE_CXX_COMPILER_TARGET="$(xx-clang++ --print-target-triple)" -DCMAKE_ASM_COMPILER_TARGET="$(xx-clang --print-target-triple)"
+  exit 0
+fi
+
+if [ -n "${printSysroot}" ]; then
+  setup
+
+  if xx-info is-cross; then
+    if [ -f "/etc/alpine-release" ]; then
+      echo "/${target}/"
+      exit 0
+    fi
+    if [ "$(xx-info os)" = "darwin" ]; then
+      detectMacOSSDK
+      echo "${macos_sdk_path}"
+      exit 0
+    fi
+  fi
+  echo "/"
+  exit 0
+fi
+
+# if setup then setup and exit
+if [ -n "${setupTarget}" ]; then
+  setup
+  exit 0
+fi
+
+# if target without a config and xx prefix then create config
+if [ -n "$target" ] && [ ! -f "/usr/bin/${target}.cfg" ] && [ -n "$wrapped" ]; then
+  setup
+fi
+
+# if no target, no default config and xx prefix then create config
+if [ -z "${target}" ] && [ ! -f /etc/llvm/xx-default.cfg ] && [ -n "$wrapped" ]; then
+  setup
+fi
+
+if [ ! -f "/usr/bin/$name" ]; then
+  echo >&2 "/usr/bin/$name not found. Make sure package is installed. xx doesn't currently support binaries in custom location"
+  exit
+fi
+
+if [ -z "$target" ] && [ -f /etc/llvm/xx-default.cfg ]; then
+  exec "/usr/bin/$name" --config /etc/llvm/xx-default.cfg "$@"
+elif [ -f "/usr/bin/${target}.cfg" ]; then
+  exec "/usr/bin/$name" --config "/usr/bin/${target}.cfg" "$@"
+else
+  exec "/usr/bin/$name" "$@"
+fi

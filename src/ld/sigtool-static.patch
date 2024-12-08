@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 16024ad..77f77b4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,9 @@ IF(CMAKE_BUILD_TYPE STREQUAL "Debug")
+   set(CMAKE_CXX_FLAGS "-g")
+ ENDIF()
+
++if(NOT BUILD_SHARED_LIBS)
++  set(OPENSSL_USE_STATIC_LIBS TRUE)
++endif()
+ find_package(OpenSSL REQUIRED)
+
+ set(CMAKE_CXX_STANDARD 11)
